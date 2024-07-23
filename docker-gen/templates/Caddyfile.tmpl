@@ -1,74 +1,362 @@
-{{ $hosts := groupByLabel $ "virtual.host" }}
+{{- /*
+     * Global values.  Values are stored in this map rather than in individual
+     * global variables so that the values can be easily passed to embedded
+     * templates.  (Go templates cannot access variables outside of their own
+     * scope.)
+     */}}
+{{- $globals := dict }}
+{{- $_ := set $globals "containers" $ }}
+{{- $_ := set $globals "Env" $.Env }}
+{{- $_ := set $globals "Docker" $.Docker }}
+{{- $_ := set $globals "CurrentContainer" (where $globals.containers "ID" $globals.Docker.CurrentContainerID | first) }}
+{{- $_ := set $globals "vhosts" (dict) }}
+{{- $_ := set $globals "networks" (dict) }}
+# key/value: virtual-host/containers
+{{- $_ := set $globals "nonwildcard" (dict) }}
+# key/(key,value): wildcard-host/(vhost, containers)
+{{- $_ := set $globals "wildcard" (dict) }}
 
-{{ if not $hosts }}
 
-127.0.0.1:2015 {
-  log {
-      output stdout
-  }
+# Networks available to the container running docker-gen (which are assumed to
+# match the networks available to the container running nginx):
+{{- /*
+     * Note: $globals.CurrentContainer may be nil in some circumstances due to
+     * <https://github.com/nginx-proxy/docker-gen/issues/458>.  For more context
+     * see <https://github.com/nginx-proxy/nginx-proxy/issues/2189>.
+     */}}
+{{- if $globals.CurrentContainer }}
+    {{- range sortObjectsByKeysAsc $globals.CurrentContainer.Networks "Name" }}
+        {{- $_ := set $globals.networks .Name . }}
+#     {{ .Name }}
+    {{- else }}
+#     (none)
+    {{- end }}
+{{- else }}
+# /!\ WARNING: Failed to find the Docker container running docker-gen.  All
+#              upstream (backend) application containers will appear to be
+#              unreachable.  Try removing the -only-exposed and -only-published
+#              arguments to docker-gen if you pass either of those.  See
+#              <https://github.com/nginx-proxy/docker-gen/issues/458>.
+{{- end }}
+
+{{- /*
+     * Template used as a function to get a container's IP address.  This
+     * template only outputs debug comments; the IP address is "returned" by
+     * storing the value in the provided dot dict.
+     *
+     * The provided dot dict is expected to have the following entries:
+     *   - "globals": Global values.
+     *   - "container": The container's RuntimeContainer struct.
+     *
+     * The return value will be added to the dot dict with key "ip".
+     */}}
+{{- define "container_ip" }}
+    {{- $ip := "" }}
+    #     networks:
+    {{- range sortObjectsByKeysAsc $.container.Networks "Name" }}
+        {{- /*
+             * TODO: Only ignore the "ingress" network for Swarm tasks (in case
+             * the user is not using Swarm mode and names a network "ingress").
+             */}}
+        {{- if eq .Name "ingress" }}
+    #         {{ .Name }} (ignored)
+            {{- continue }}
+        {{- end }}
+        {{- if eq .Name "host" }}
+            {{- /* Handle containers in host nework mode */}}
+            {{- if (index $.globals.networks "host") }}
+    #         both container and proxy are in host network mode, using localhost IP
+                {{- $ip = "127.0.0.1" }}
+                {{- continue }}
+            {{- end }}
+            {{- range sortObjectsByKeysAsc $.globals.CurrentContainer.Networks "Name" }}
+                {{- if and . .Gateway (not .Internal) }}
+    #         container is in host network mode, using {{ .Name }} gateway IP
+                    {{- $ip = .Gateway }}
+                    {{- break }}
+                {{- end }}
+            {{- end }}
+            {{- if $ip }}
+                {{- continue }}
+            {{- end }}
+        {{- end }}
+        {{- if and (not (index $.globals.networks .Name)) (not $.globals.networks.host) }}
+    #         {{ .Name }} (unreachable)
+            {{- continue }}
+        {{- end }}
+        {{- /*
+             * Do not emit multiple `server` directives for this container if it
+             * is reachable over multiple networks.  This avoids accidentally
+             * inflating the effective round-robin weight of a server due to the
+             * redundant upstream addresses that nginx sees as belonging to
+             * distinct servers.
+             */}}
+        {{- if $ip }}
+    #         {{ .Name }} (ignored; reachable but redundant)
+            {{- continue }}
+        {{- end }}
+    #         {{ .Name }} (reachable)
+        {{- if and . .IP }}
+            {{- $ip = .IP }}
+        {{- else }}
+    #             /!\ No IP for this network!
+        {{- end }}
+    {{- else }}
+    #         (none)
+    {{- end }}
+    #     IP address: {{ if $ip }}{{ $ip }}{{ else }}(none usable){{ end }}
+    {{- $_ := set $ "ip" $ip }}
+{{- end }}
+
+{{- /*
+     * Template used as a function to get the port of the server in the given
+     * container.  This template only outputs debug comments; the port is
+     * "returned" by storing the value in the provided dot dict.
+     *
+     * The provided dot dict is expected to have the following entries:
+     *   - "container": The container's RuntimeContainer struct.
+     *
+     * The return value will be added to the dot dict with key "port".
+     */}}
+{{- define "container_port" }}
+    {{- /* If only 1 port exposed, use that as a default, else 80. */}}
+    #     exposed ports:{{ range sortObjectsByKeysAsc $.container.Addresses "Port" }} {{ .Port }}/{{ .Proto }}{{ else }} (none){{ end }}
+    {{ $port := trim (index $.container.Labels "virtual.port") }}
+    {{ if eq $port ""}}{{ $port = "80" }}{{ end }}
+    #     using port: {{ $port }}
+    {{- $_ := set $ "port" $port }}
+{{- end }}
+
+{{- /*
+     * Template used to setup requests encoding and output sink
+     */}}
+{{- define "encode-and-log" }}
+        encode zstd gzip
+        log {
+            output stdout
+        }
+{{- end }}
+
+{{- /*
+     * Template used as a function to get the settings in the given
+     * container.  This template only outputs debug comments; the settings is
+     * "returned" by storing the value in the provided dot dict.
+     *
+     * The provided dot dict is expected to have the following entries:
+     *   - "container": The container's RuntimeContainer struct.
+     *
+     * The return value will be added to the dot dict with setting keys:
+     * tlsVal, tlsOff, tlsOn, alias, aliasPresent, authUsername, authPassword,
+     * authPath, basicauth, hostDirectives, hostImport, proxyMatcher,
+     * proxyDirectives, proxyLBPolicy, proxyImport, disableWildcard, vhost
+     */}}
+{{- define "container_settings" }}
+    {{- $c := $.container }}
+
+    {{ $tlsEmail := trim (index $c.Labels "virtual.tls-email") }}
+    {{ $tlsCustomConfig := trim (index $c.Labels "virtual.tls") }}
+    {{ $tlsVal := "\n{\ndns cloudflare {env.CLOUDFLARE_API_TOKEN} \n}\n" }}
+    {{ if ne $tlsEmail "" }}
+        {{ $tlsVal = $tlsEmail }}
+    {{ else if ne $tlsCustomConfig "" }}
+        {{ $tlsVal  = $tlsCustomConfig }}
+    {{ end }}
+    {{ $disableWildcardValue := trim (index $c.Labels "virtual.disable-wildcard") }}
+    {{ $disableWildcard := eq $disableWildcardValue "true" }}
+    {{ $tlsDisabled := trim (index $c.Labels "virtual.tls-disabled") }}
+    {{ $tlsOff := eq $tlsDisabled "true" }}
+    {{ $tlsOn := ne $tlsDisabled "true" }}
+    {{ $alias := trim (index $c.Labels "virtual.alias") }}
+    {{ $aliasPresent := ne $alias "" }}
+    {{ $authUsername := trim (index $c.Labels "virtual.auth.username") }}
+    {{ $authPassword := trim (index $c.Labels "virtual.auth.password") }}
+    {{ $authPath := trim (index $c.Labels "virtual.auth.path") }}
+    {{ $basicauth := and (ne $authUsername "") (ne $authPassword "") }}
+    {{ $hostDirectives := trim (index $c.Labels "virtual.host.directives") }}
+    {{ $hostImport := trim (index $c.Labels "virtual.host.import") }}
+    {{ $proxyMatcher := trim (index $c.Labels "virtual.proxy.matcher") }}
+    {{ $proxyDirectives := trim (index $c.Labels "virtual.proxy.directives") }}
+    {{ $proxyLBPolicy := or (trim (index $c.Labels "virtual.proxy.lb_policy")) "round_robin" }}
+    {{ $proxyImport := trim (index $c.Labels "virtual.proxy.import") }}
+    {{ $vhost := trim (index $c.Labels "virtual.host") }}
+
+    {{- $_ := set $ "tlsVal" $tlsVal }}
+    {{- $_ := set $ "disableWildcard" $disableWildcard }}
+    {{- $_ := set $ "tlsOff" $tlsOff }}
+    {{- $_ := set $ "tlsOn" $tlsOn }}
+    {{- $_ := set $ "alias" $alias }}
+    {{- $_ := set $ "aliasPresent" $aliasPresent }}
+    {{- $_ := set $ "authUsername" $authUsername }}
+    {{- $_ := set $ "authPassword" $authPassword }}
+    {{- $_ := set $ "authPath" $authPath }}
+    {{- $_ := set $ "basicauth" $basicauth }}
+    {{- $_ := set $ "hostDirectives" $hostDirectives }}
+    {{- $_ := set $ "hostImport" $hostImport }}
+    {{- $_ := set $ "proxyMatcher" $proxyMatcher }}
+    {{- $_ := set $ "proxyDirectives" $proxyDirectives }}
+    {{- $_ := set $ "proxyLBPolicy" $proxyLBPolicy }}
+    {{- $_ := set $ "proxyImport" $proxyImport }}
+    {{- $_ := set $ "vhost" $vhost }}
+{{- end }}
+
+{{- /*
+     * Template used to print nonwildcard config
+     * 
+     * The provided dot dict is expected to have the following entries:
+     *   - "globals": Global values.
+     *   - "settings": Settings for reverse proxy.
+     *   - "containers": The containers RuntimeContainer structures.
+     *   - "vhost": The containers vhost address
+     */}}
+{{- define "nonwildcard" }}
+    {{ if $.settings.aliasPresent }}
+    {{ if $.settings.tlsOff }}http://{{ end }}{{ $.settings.alias }} {
+        redir {{ if $.settings.tlsOff }}http://{{ else }}https://{{ end }}{{ $.vhost }}
+    }
+    {{ end }}
+    {{ if $.settings.tlsOff }}http://{{ end }}{{ $.vhost }} {
+    {{ if $.settings.tlsOn }}
+        tls {{ $.settings.tlsVal }}
+    {{ end }}
+    
+    {{ $nature_args := dict "globals" $.globals "settings" $.settings "containers" $.containers }}
+    {{ template "reverse-proxy-nature" $nature_args }}
+
+    {{ template "encode-and-log" }}
+
+    }
+{{- end }}
+
+{{- /*
+     * Template used to print wild config
+     * 
+     * The provided dot dict is expected to have the following entries:
+     *   - "globals": Global values.
+     *   - "settings": Settings for reverse proxy.
+     *   - "containers": The containers RuntimeContainer structures by vhost key (vhost: containers)
+     *   - "whost": The containers wildcard host address
+     */}}
+{{- define "wildcard" }}
+    
+    {{ $.whost }} {
+        tls {
+            dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+        }
+
+    {{ range $v, $c := $.containers }}
+        {{- $args := dict "container" (first $c) }}
+        {{- template "container_settings" $args }}
+
+        @{{ $v }} host {{ $v }}
+        handle @{{ $v }} {
+            {{ $nature_args := dict "globals" $.globals "settings" $args "containers" $c }}
+            {{ template "reverse-proxy-nature" $nature_args }}
+        }
+    {{ end }}
+
+        # Fallback for otherwise unhandled domains
+        handle {
+            abort
+        }
+
+        {{ template "encode-and-log" }}
+
+    }
+{{- end }}
+
+{{- /*
+     * Template used to print nature of reverse proxy setting
+     * 
+     * The provided dot dict is expected to have the following entries:
+     *   - "globals": Global values.
+     *   - "settings": Settings for reverse proxy.
+     *   - "containers": The containers RuntimeContainer structures.
+     */}}
+{{- define "reverse-proxy-nature" }}
+            {{ $.settings.hostDirectives }}
+    {{ if $.settings.hostImport }}
+            import {{ $.settings.hostImport }}
+    {{ end }}
+
+    {{ if $.settings.basicauth }}
+            basicauth {{ $.settings.authPath }} {
+                {{ $.settings.authUsername }} {{ $.settings.authPassword }}
+            }
+    {{ end }}
+            reverse_proxy {{ $.settings.proxyMatcher }} {
+                lb_policy {{ $.settings.proxyLBPolicy }}
+                {{ $.settings.proxyDirectives }}
+                {{ if $.settings.proxyImport }}
+                import {{ $.settings.proxyImport }}
+                {{ end }}
+
+    {{ $to := "" }}
+    {{ range $i, $next := $.containers }}
+        {{ $container_port_args := dict "container" $next }}
+        {{ template "container_port" $container_port_args}}
+        {{ $port := $container_port_args.port}}
+
+        {{ $container_ip_args := dict "globals" $.globals "container" $next }}
+        {{ template "container_ip" $container_ip_args }}
+        {{ $ip := $container_ip_args.ip }}
+
+        {{ $next_to := list $ip ":" $port | join "" }}
+        {{ $to = list $to $next_to | join "" }}
+    {{ end }}
+    
+
+                to {{ $to }}
+            }
+{{- end }}
+
+{{ $candidates := whereLabelExists $globals.containers "virtual.host" }}
+{{ if eq (len $candidates) 0 }}
+
+127.0.0.1:80 {
+    log {
+        output stdout
+    }
 }
-
 
 {{ else }}
 
-{{ range $h, $containers := $hosts }}
-{{ $c := first $containers }}
-{{ $allhosts := trim (index $c.Labels "virtual.host") }}
-{{ range $t, $host := split $allhosts " " }}
-{{ $tlsEmail := trim (index $c.Labels "virtual.tls-email") }}
-{{ $tlsConfig := trim (index $c.Labels "virtual.tls") }}
-{{ $tlsEnv := or $tlsEmail $tlsConfig }}
-{{ $tlsOff := eq $tlsEnv "" }}
-{{ $tlsOn := ne $tlsEnv "" }}
-{{ $alias := trim (index $c.Labels "virtual.alias") }}
-{{ $aliasPresent := ne $alias "" }}
-{{ $authUsername := trim (index $c.Labels "virtual.auth.username") }}
-{{ $authPassword := trim (index $c.Labels "virtual.auth.password") }}
-{{ $authPath := trim (index $c.Labels "virtual.auth.path") }}
-{{ $basicauth := and (ne $authUsername "") (ne $authPassword "") }}
-{{ $hostDirectives := trim (index $c.Labels "virtual.host.directives") }}
-{{ $hostImport := trim (index $c.Labels "virtual.host.import") }}
-{{ $proxyMatcher := trim (index $c.Labels "virtual.proxy.matcher") }}
-{{ $proxyDirectives := trim (index $c.Labels "virtual.proxy.directives") }}
-{{ $proxyLBPolicy := or (trim (index $c.Labels "virtual.proxy.lb_policy")) "round_robin" }}
-{{ $proxyImport := trim (index $c.Labels "virtual.proxy.import") }}
+    {{- /* Loop over $globals.containers "virtual.host" label and mark each container as wildcard and nonwildcard */}}
+    {{- range $i, $c := (whereLabelExists $globals.containers "virtual.host") }}
+        {{- $args := dict "container" $c }}
+        {{- template "container_settings" $args }}
+        {{- $vhost := $args.vhost }}
+        {{- $vhostparts := splitList "." $vhost }}
+        {{- $disableWildcard := $args.disableWildcard }}
+        {{- if and (gt (len $vhostparts) 2) (not $disableWildcard) }}
+            {{- $whost_rested := $vhostparts | rest }}
+            {{- $whost := prepend $whost_rested "*" | join "." }}
+            {{- if (not (hasKey $globals.wildcard $whost)) }}
+                {{- $_ := set $globals.wildcard $whost (dict) }}
+            {{- end }}
+            {{- if (not (hasKey (get $globals.wildcard $whost) $vhost )) }}
+                {{- $_ := set (get $globals.wildcard $whost) $vhost (list) }}
+            {{- end }}
+            {{- $_ := set (get $globals.wildcard $whost) $vhost (append (get (get $globals.wildcard $whost) $vhost) $c) }}
+        {{- else }}
+            {{- if (not (hasKey $globals.nonwildcard $vhost)) }}
+                {{- $_ := set $globals.nonwildcard $vhost (list) }}
+            {{- end }}
+            {{- $_ := set $globals.nonwildcard $vhost (append (get $globals.nonwildcard $vhost) $c) }}
+        {{- end }}
+    {{- end }}
 
-{{ if $aliasPresent  }}
-{{ if $tlsOff }}http://{{ end }}{{ $alias }} {
-  redir {{ if $tlsOff }}http://{{ else }}https://{{ end }}{{ $host }}
-}
-{{ end }}
+    {{- /* Loop over nonwildcard */}}
+    {{- range $vhost, $containers := $globals.nonwildcard }}
+        {{- $args := dict "container" (first $containers) }}
+        {{- template "container_settings" $args }}
 
-{{ if $tlsOff }}http://{{ end }}{{ $host }} {
-  {{ if $tlsOn }}tls {{ $tlsEnv }}{{ end }}
+        {{ $nonwildcard_args := dict "globals" $globals "settings" $args "containers" $containers "vhost" $vhost }}
+        {{ template "nonwildcard" $nonwildcard_args}}
+    {{- end }}
 
-  {{ $hostDirectives }}
-  {{ if $hostImport }}import {{ $hostImport }}{{ end }}
-
-  {{ if $basicauth }}
-  basicauth {{ $authPath }} {
-      {{ $authUsername }} {{ $authPassword }}
-  }
-  {{ end }}
-
-  reverse_proxy {{ $proxyMatcher }} {
-    lb_policy {{ $proxyLBPolicy }}
-    {{ $proxyDirectives }}
-    {{ if $proxyImport }}import {{ $proxyImport }}{{ end }}
-    {{ range $i, $container := $containers }}
-    {{ range $j, $net := $container.Networks }}
-    {{ $port := or (trim (index $container.Labels "virtual.port")) "80" }}
-    to {{ $net.IP }}:{{ $port }}
-    {{ end }}
-    {{ end }}
-  }
-
-  encode zstd gzip
-  log {
-    output stdout
-  }
-}
-{{ end }}
-{{ end }}
+    {{- range $whost, $containersbyvhost := $globals.wildcard }}
+        {{ $wildcard_args := dict "globals" $globals "containers" $containersbyvhost "whost" $whost }}
+        {{ template "wildcard" $wildcard_args}}
+    {{- end }}
 
 {{ end }}

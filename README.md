@@ -8,6 +8,14 @@ A perfect mix of [`Caddy`](https://github.com/mholt/caddy), [`docker-gen`](https
 
 ---
 
+## Changes from original caddy_gen
+
+* Added DNS challenge module to caddy
+  * Pass CLOUDFLARE_API_TOKEN anvironment to caddy_gen container for DNS challenge wildcard certificates (it will fail challenge in case of no CLOUDFLARE_API_TOKEN and at least one wildcard group)
+* Reworked template to group hosts by wildcard site
+  * Added optional label to ungroup concrete container from wildcard and create separeted site config for it: `virtual.disable-wildcard=true`
+* Fixed bug when caddy_gen adds to loadbalancing unreachable ips from different networks
+
 ## Why
 
 Using `Caddy` as your primary web server is super simple.

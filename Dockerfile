@@ -1,4 +1,16 @@
-FROM caddy:2.8.4-alpine
+# Build stage
+ARG CADDY_VERSION="2.8.4"
+FROM caddy:${CADDY_VERSION}-builder-alpine AS builder
+
+# Build Caddy with the Cloudflare DNS module
+RUN xcaddy build \
+    --with github.com/caddy-dns/cloudflare
+
+# Final stage
+FROM caddy:${CADDY_VERSION}-alpine
+
+# Copy the custom-built Caddy binary
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 
 ARG DOCKER_GEN_VERSION="0.14.0"
 ARG FOREGO_VERSION="0.16.1"
@@ -20,7 +32,7 @@ RUN apk update && apk upgrade \
   && rm "docker-gen-alpine-linux-amd64-${DOCKER_GEN_VERSION}.tar.gz" \
   && apk del .build-dependencies
 
-EXPOSE 80 443 2015
+EXPOSE 80 443
 VOLUME /etc/caddy
 
 # Starting app:

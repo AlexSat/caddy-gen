@@ -13,6 +13,13 @@ services:
       - "443:443"
     environment:
       CADDY_SNIPPET: /tmp/caddy_global_options
+      #Cloudflare api token for DNS challenge for https certificates
+      #Go to https://dash.cloudflare.com/profile/api-tokens
+      #Create token
+      #Zone - Zone - Read
+      #Zone - DNS - Edit
+      #Include - All zones
+      CLOUDFLARE_API_TOKEN: cloudflare-api-token-here
     depends_on:
       - whoami
       - whoami2
