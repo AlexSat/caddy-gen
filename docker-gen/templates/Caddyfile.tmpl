@@ -301,7 +301,7 @@
         {{ $ip := $container_ip_args.ip }}
 
         {{ $next_to := list $ip ":" $port | join "" }}
-        {{ $to = list $to $next_to | join "" }}
+        {{ $to = list $to $next_to | join " " }}
     {{ end }}
     
 
