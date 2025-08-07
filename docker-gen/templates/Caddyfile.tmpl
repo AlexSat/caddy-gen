@@ -279,7 +279,7 @@
     {{ end }}
 
     {{ if $.settings.basicauth }}
-            basicauth {{ $.settings.authPath }} {
+            basic_auth {{ $.settings.authPath }} {
                 {{ $.settings.authUsername }} {{ $.settings.authPassword }}
             }
     {{ end }}
