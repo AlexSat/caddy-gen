@@ -15,6 +15,8 @@
 {{- $_ := set $globals "nonwildcard" (dict) }}
 # key/(key,value): wildcard-host/(vhost, containers)
 {{- $_ := set $globals "wildcard" (dict) }}
+# key/[]values: nonwildcard-host/[]strings of directives
+{{- $_ := set $globals "nonwildcard_directives" (dict) }}
 
 
 # Networks available to the container running docker-gen (which are assumed to
@@ -179,6 +181,7 @@
     {{ $proxyLBPolicy := or (trim (index $c.Labels "virtual.proxy.lb_policy")) "round_robin" }}
     {{ $proxyImport := trim (index $c.Labels "virtual.proxy.import") }}
     {{ $vhost := trim (index $c.Labels "virtual.host") }}
+    {{ $rootDirective := trim (index $c.Labels "root.directive") }}
 
     {{- $_ := set $ "tlsVal" $tlsVal }}
     {{- $_ := set $ "disableWildcard" $disableWildcard }}
@@ -197,6 +200,7 @@
     {{- $_ := set $ "proxyLBPolicy" $proxyLBPolicy }}
     {{- $_ := set $ "proxyImport" $proxyImport }}
     {{- $_ := set $ "vhost" $vhost }}
+    {{- $_ := set $ "rootDirective" $rootDirective }}
 {{- end }}
 
 {{- /*
@@ -207,6 +211,7 @@
      *   - "settings": Settings for reverse proxy.
      *   - "containers": The containers RuntimeContainer structures.
      *   - "vhost": The containers vhost address
+     *   - "rootDirectives": Additional root directives (list) from wildcard vhosts
      */}}
 {{- define "nonwildcard" }}
     {{ if $.settings.aliasPresent }}
@@ -218,10 +223,43 @@
     {{ if $.settings.tlsOn }}
         tls {{ $.settings.tlsVal }}
     {{ end }}
+
+    {{ if (hasKey $.rootDirectives $.vhost) }}
+        {{ $directives := get $.rootDirectives $.vhost }}
+        {{ if (gt (len $directives) 0) }}
+           {{ range $i, $directive := $directives }}
+               {{ $directive }}
+           {{ end }} 
+        {{ end }}
+    {{ end }}
     
     {{ $nature_args := dict "globals" $.globals "settings" $.settings "containers" $.containers }}
     {{ template "reverse-proxy-nature" $nature_args }}
 
+    {{ template "encode-and-log" }}
+
+    }
+{{- end }}
+
+{{- /*
+     * Template used to print nonwildcard directives only config. For now supports https only.
+     * 
+     * The provided dot dict is expected to have the following entries:
+     *   - "whost": The containers vhost address
+     *   - "directives": Additional root directives (list) from wildcard vhosts
+     */}}
+{{- define "nonwildcard_directives" }}
+    {{ $.whost }} {
+        tls {
+            dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+        }
+
+    {{ if (gt (len $.directives) 0) }}
+       {{ range $i, $directive := $.directives }}
+           {{ $directive }}
+       {{ end }}
+    {{ end }} 
+    
     {{ template "encode-and-log" }}
 
     }
@@ -337,6 +375,13 @@
                 {{- $_ := set (get $globals.wildcard $whost) $vhost (list) }}
             {{- end }}
             {{- $_ := set (get $globals.wildcard $whost) $vhost (append (get (get $globals.wildcard $whost) $vhost) $c) }}
+            {{- if ne $args.rootDirective "" }}
+                {{- $whost_joined := $whost_rested | join "." }}
+                {{- if (not (hasKey $globals.nonwildcard_directives $whost_joined)) }}
+                    {{- $_ := set $globals.nonwildcard_directives $whost_joined (list) }}
+                {{- end }}
+                {{- $_ := set $globals.nonwildcard_directives $whost_joined (append (get $globals.nonwildcard_directives $whost_joined) $args.rootDirective) }}
+            {{- end }}
         {{- else }}
             {{- if (not (hasKey $globals.nonwildcard $vhost)) }}
                 {{- $_ := set $globals.nonwildcard $vhost (list) }}
@@ -345,13 +390,24 @@
         {{- end }}
     {{- end }}
 
+    {{ $templated_nonwildcards := (list) }}
     {{- /* Loop over nonwildcard */}}
     {{- range $vhost, $containers := $globals.nonwildcard }}
         {{- $args := dict "container" (first $containers) }}
         {{- template "container_settings" $args }}
 
-        {{ $nonwildcard_args := dict "globals" $globals "settings" $args "containers" $containers "vhost" $vhost }}
+        {{ $nonwildcard_args := dict "globals" $globals "settings" $args "containers" $containers "vhost" $vhost "rootDirectives" $globals.nonwildcard_directives }}
         {{ template "nonwildcard" $nonwildcard_args}}
+        {{ $templated_nonwildcards := append $templated_nonwildcards $vhost }}
+        #$templated_nonwildcards = {{  $templated_nonwildcards  }}
+    {{- end }}
+
+    {{- /* Loop over non templated nonwildcard directives */}}
+    {{- range $whost, $wdirectives := $globals.nonwildcard_directives }}
+        {{- if (not (has $whost $templated_nonwildcards)) }}
+            {{ $nonwildcard_directives_args := dict "whost" $whost "directives" $wdirectives }}
+            {{ template "nonwildcard_directives" $nonwildcard_directives_args }}
+        {{- end }}
     {{- end }}
 
     {{- range $whost, $containersbyvhost := $globals.wildcard }}
