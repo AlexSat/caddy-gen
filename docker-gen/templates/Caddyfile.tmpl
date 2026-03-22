@@ -136,6 +136,7 @@
         encode zstd gzip
         log {
             output stdout
+            output file /var/log/access.log
         }
 {{- end }}
 
