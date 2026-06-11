@@ -1,3 +1,8 @@
+{
+	log {
+            output file /var/log/access.log
+        }
+}
 {{- /*
      * Global values.  Values are stored in this map rather than in individual
      * global variables so that the values can be easily passed to embedded
@@ -134,9 +139,8 @@
      */}}
 {{- define "encode-and-log" }}
         encode zstd gzip
-        log {
+        log toconsole {
             output stdout
-            output file /var/log/access.log
         }
 {{- end }}
 
@@ -282,6 +286,7 @@
             dns cloudflare {env.CLOUDFLARE_API_TOKEN}
         }
 
+    {{ template "encode-and-log" }}
     {{ range $v, $c := $.containers }}
         {{- $args := dict "container" (first $c) }}
         {{- template "container_settings" $args }}
