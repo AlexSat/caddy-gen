@@ -12,7 +12,7 @@ FROM caddy:${CADDY_VERSION}-alpine
 # Copy the custom-built Caddy binary
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 
-ARG DOCKER_GEN_VERSION="0.14.0"
+ARG DOCKER_GEN_VERSION="0.16.5"
 ARG FOREGO_VERSION="0.16.1"
 
 ENV CADDYPATH="/etc/caddy"

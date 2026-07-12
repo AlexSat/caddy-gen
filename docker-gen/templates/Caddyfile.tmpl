@@ -59,6 +59,8 @@
      */}}
 {{- define "container_ip" }}
     {{- $ip := "" }}
+    {{- $container_name := "" }}
+    # conteiner.Name: {{ $.container.Name }}
     #     networks:
     {{- range sortObjectsByKeysAsc $.container.Networks "Name" }}
         {{- /*
@@ -105,6 +107,7 @@
     #         {{ .Name }} (reachable)
         {{- if and . .IP }}
             {{- $ip = .IP }}
+            {{- $container_name = $.container.Name }}
         {{- else }}
     #             /!\ No IP for this network!
         {{- end }}
@@ -113,6 +116,7 @@
     {{- end }}
     #     IP address: {{ if $ip }}{{ $ip }}{{ else }}(none usable){{ end }}
     {{- $_ := set $ "ip" $ip }}
+    {{- $_ := set $ "container_name" $container_name }}
 {{- end }}
 
 {{- /*
@@ -342,7 +346,8 @@
 
         {{ $container_ip_args := dict "globals" $.globals "container" $next }}
         {{ template "container_ip" $container_ip_args }}
-        {{ $ip := $container_ip_args.ip }}
+	# previously $container_ip_args.ip
+        {{ $ip := $container_ip_args.container_name }}
 
         {{ $next_to := list $ip ":" $port | join "" }}
         {{ $to = list $to $next_to | join " " }}
