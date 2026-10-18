@@ -22,6 +22,8 @@
 {{- $_ := set $globals "wildcard" (dict) }}
 # key/[]values: nonwildcard-host/[]strings of directives
 {{- $_ := set $globals "nonwildcard_directives" (dict) }}
+# key/(key,[]values): wildcard-host/(vhost, []strings of directives) from CADDY_EXTRA_FILE
+{{- $_ := set $globals "wildcard_extra" (dict) }}
 
 
 # Networks available to the container running docker-gen (which are assumed to
@@ -282,6 +284,7 @@
      *   - "settings": Settings for reverse proxy.
      *   - "containers": The containers RuntimeContainer structures by vhost key (vhost: containers)
      *   - "whost": The containers wildcard host address
+     *   - "extras": Extra directives by vhost key (vhost: []directives) from CADDY_EXTRA_FILE
      */}}
 {{- define "wildcard" }}
     
@@ -297,9 +300,27 @@
 
         @{{ $v }} host {{ $v }}
         handle @{{ $v }} {
+            {{- /* Extra directives for a vhost that also has containers */}}
+            {{- if hasKey $.extras $v }}
+                {{- range $d := get $.extras $v }}
+            {{ $d }}
+                {{- end }}
+            {{- end }}
             {{ $nature_args := dict "globals" $.globals "settings" $args "containers" $c }}
             {{ template "reverse-proxy-nature" $nature_args }}
         }
+    {{ end }}
+
+    {{- /* Extra vhosts (from CADDY_EXTRA_FILE) without containers */}}
+    {{ range $v, $directives := $.extras }}
+        {{- if not (hasKey $.containers $v) }}
+        @{{ $v }} host {{ $v }}
+        handle @{{ $v }} {
+            {{- range $d := $directives }}
+            {{ $d }}
+            {{- end }}
+        }
+        {{- end }}
     {{ end }}
 
         # Fallback for otherwise unhandled domains
@@ -358,8 +379,29 @@
             }
 {{- end }}
 
+{{- /*
+     * Extra entries from the JSON file whose path is given in the
+     * CADDY_EXTRA_FILE env variable. Expected format:
+     *   [
+     *     { "host": "nas.example.com", "directives": ["reverse_proxy 10.0.0.2:5000"] },
+     *     { "host": "example.com",     "directives": "redir https://www.example.com{uri}" },
+     *     { "host": "a.b.example.com", "disable_wildcard": true, "directives": [...] }
+     *   ]
+     */}}
+{{- $extraFile := trim (index $globals.Env "CADDY_EXTRA_FILE") }}
+{{- $extras := list }}
+{{- if and (ne $extraFile "") (exists $extraFile) }}
+    {{- $raw := trim (include $extraFile) }}
+    {{- if ne $raw "" }}
+        {{- $extras = parseJson $raw }}
+    {{- end }}
+# extra entries loaded from {{ $extraFile }}
+{{- else if ne $extraFile "" }}
+# /!\ WARNING: CADDY_EXTRA_FILE={{ $extraFile }} not found, extra entries skipped
+{{- end }}
+
 {{ $candidates := whereLabelExists $globals.containers "virtual.host" }}
-{{ if eq (len $candidates) 0 }}
+{{ if and (eq (len $candidates) 0) (eq (len $extras) 0) }}
 
 127.0.0.1:80 {
     log {
@@ -370,7 +412,7 @@
 {{ else }}
 
     {{- /* Loop over $globals.containers "virtual.host" label and mark each container as wildcard and nonwildcard */}}
-    {{- range $i, $c := (whereLabelExists $globals.containers "virtual.host") }}
+    {{- range $i, $c := $candidates }}
         {{- $args := dict "container" $c }}
         {{- template "container_settings" $args }}
         {{- $vhost := $args.vhost }}
@@ -401,6 +443,37 @@
         {{- end }}
     {{- end }}
 
+    {{- /* Loop over extra entries and mark each as wildcard or nonwildcard */}}
+    {{- range $i, $e := $extras }}
+        {{- $host := trim (toString (default "" (index $e "host"))) }}
+        {{- $d := default "" (index $e "directives") }}
+        {{- if kindIs "slice" $d }}{{ $d = join "\n" $d }}{{ end }}
+        {{- $d = trim (toString $d) }}
+        {{- $noWildcard := eq (toString (default "" (index $e "disable_wildcard"))) "true" }}
+        {{- $hostparts := splitList "." $host }}
+        {{- if eq $host "" }}
+# /!\ WARNING: extra entry #{{ $i }} has no "host", skipped
+        {{- else if and (gt (len $hostparts) 2) (not $noWildcard) }}
+            {{- $whost := prepend (rest $hostparts) "*" | join "." }}
+            {{- if not (hasKey $globals.wildcard $whost) }}
+                {{- $_ := set $globals.wildcard $whost (dict) }}
+            {{- end }}
+            {{- if not (hasKey $globals.wildcard_extra $whost) }}
+                {{- $_ := set $globals.wildcard_extra $whost (dict) }}
+            {{- end }}
+            {{- $we := get $globals.wildcard_extra $whost }}
+            {{- if not (hasKey $we $host) }}
+                {{- $_ := set $we $host (list) }}
+            {{- end }}
+            {{- $_ := set $we $host (append (get $we $host) $d) }}
+        {{- else }}
+            {{- if not (hasKey $globals.nonwildcard_directives $host) }}
+                {{- $_ := set $globals.nonwildcard_directives $host (list) }}
+            {{- end }}
+            {{- $_ := set $globals.nonwildcard_directives $host (append (get $globals.nonwildcard_directives $host) $d) }}
+        {{- end }}
+    {{- end }}
+
     {{ $templated_nonwildcards := (list) }}
     {{- /* Loop over nonwildcard */}}
     {{- range $vhost, $containers := $globals.nonwildcard }}
@@ -409,8 +482,7 @@
 
         {{ $nonwildcard_args := dict "globals" $globals "settings" $args "containers" $containers "vhost" $vhost "rootDirectives" $globals.nonwildcard_directives }}
         {{ template "nonwildcard" $nonwildcard_args}}
-        {{ $templated_nonwildcards := append $templated_nonwildcards $vhost }}
-        #$templated_nonwildcards = {{  $templated_nonwildcards  }}
+        {{- $templated_nonwildcards = append $templated_nonwildcards $vhost }}
     {{- end }}
 
     {{- /* Loop over non templated nonwildcard directives */}}
@@ -422,8 +494,13 @@
     {{- end }}
 
     {{- range $whost, $containersbyvhost := $globals.wildcard }}
-        {{ $wildcard_args := dict "globals" $globals "containers" $containersbyvhost "whost" $whost }}
+        {{- $wextras := dict }}
+        {{- if hasKey $globals.wildcard_extra $whost }}
+            {{- $wextras = get $globals.wildcard_extra $whost }}
+        {{- end }}
+        {{ $wildcard_args := dict "globals" $globals "containers" $containersbyvhost "whost" $whost "extras" $wextras }}
         {{ template "wildcard" $wildcard_args}}
     {{- end }}
 
 {{ end }}
+
